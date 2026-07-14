@@ -1,0 +1,835 @@
+"""
+Linux Screen Capture / Recording / Sharing Monitor
+
+Linux port of the Windows agent's ScreenCaptureMonitor
+(agents/endpoint/windows/screen_capture_monitor.cpp / .h). Mirrors its
+architecture and decision model as closely as the two platforms allow:
+
+    * process_monitor_thread  -> psutil-based detection of screenshot,
+      screen-recording and screen-sharing applications (the Linux
+      equivalent of Windows' ProcessMonitorThread / TerminateProcessByName).
+    * content_scan_thread     -> periodic screenshot + OCR classification
+      that maintains ``self.screen_is_sensitive`` (the Linux equivalent of
+      Windows' ContentScanThread / m_screenIsSensitive).
+    * keyboard_monitor_thread -> evdev-based detection of PrintScreen-style
+      shortcuts (the Linux equivalent of Windows' low-level keyboard hook).
+
+Platform differences from the Windows implementation, and why:
+
+    * Windows installs a low-level keyboard HOOK that can literally swallow
+      the PrintScreen keystroke before the OS acts on it. There is no
+      equivalent portable, unprivileged mechanism on Linux: doing the same
+      thing here would mean exclusively grabbing every input device
+      (evdev `grab()`) and re-injecting every non-blocked key through a
+      virtual `uinput` device -- i.e. turning this module into a
+      general-purpose system-wide keystroke interceptor/injector. That is
+      a much bigger (and much more dangerous, dual-use) capability than a
+      DLP screenshot filter needs, so this port deliberately does not do
+      it. Instead, the keyboard thread *detects and logs* the shortcut
+      (as requested) and, in Protection Mode, triggers an immediate
+      reactive sweep of the process list so that any screenshot/recording
+      tool the shortcut just spawned is killed within one poll cycle.
+      The process-monitor layer is the real enforcement mechanism; the
+      keyboard layer is a fast detector, exactly as documented in
+      _handle_keyboard_shortcut() below.
+    * Windows timestamps hardcode an IST offset. The rest of this Linux
+      agent (agent.py, print_monitor.py) uses naive UTC ISO-8601 timestamps,
+      so this module does the same for consistency with the existing
+      pipeline/server rather than copying the Windows quirk.
+    * Active-window and screenshot capture require X11. Both are no-ops
+      (with a one-time log message, not a crash) under Wayland, where no
+      portable API exists for either. Process/keyboard/OCR-of-last-frame
+      detection still function; see README for the Wayland limitation.
+
+This module intentionally has no knowledge of *how* events reach the
+DLP server -- it only ever calls the ``event_callback`` it was given.
+See agent.py's ``handle_screen_capture_event`` for how the Linux agent
+wires these events into ``DLPAgent.send_event()``.
+"""
+
+import os
+import time
+import logging
+import threading
+import subprocess
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+import psutil
+
+try:
+    from PIL import Image, ImageGrab
+    PIL_AVAILABLE = True
+except ImportError:
+    Image = None
+    ImageGrab = None
+    PIL_AVAILABLE = False
+
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    pytesseract = None
+    TESSERACT_AVAILABLE = False
+
+try:
+    from Xlib import X
+    from Xlib import display as xlib_display
+    from Xlib.error import XError
+    XLIB_AVAILABLE = True
+except ImportError:
+    X = None
+    xlib_display = None
+    XError = Exception
+    XLIB_AVAILABLE = False
+
+try:
+    import evdev
+    from evdev import ecodes
+    EVDEV_AVAILABLE = True
+except ImportError:
+    evdev = None
+    ecodes = None
+    EVDEV_AVAILABLE = False
+
+logger = logging.getLogger("dlp-agent.screen-capture")
+
+
+# â”€â”€â”€ Classification levels (match CLASSIFICATION_SYSTEM.md) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+CLASSIFICATION_PUBLIC = "Public"
+CLASSIFICATION_INTERNAL = "Internal"
+CLASSIFICATION_CONFIDENTIAL = "Confidential"
+CLASSIFICATION_RESTRICTED = "Restricted"
+
+# Screenshots/recording/sharing are only blocked for these two levels,
+# matching the Windows m_classifier check:
+#   nowSensitive = (classification == "Restricted" || classification == "Confidential")
+SENSITIVE_CLASSIFICATIONS = {CLASSIFICATION_CONFIDENTIAL, CLASSIFICATION_RESTRICTED}
+
+_CLASSIFICATION_RANK = {
+    CLASSIFICATION_PUBLIC: 0,
+    CLASSIFICATION_INTERNAL: 1,
+    CLASSIFICATION_CONFIDENTIAL: 2,
+    CLASSIFICATION_RESTRICTED: 3,
+}
+
+# Keyword -> classification level. Matched case-insensitively against the
+# active window title plus any OCR'd screen text. When several keywords
+# match, the highest-ranked classification wins.
+DEFAULT_SENSITIVE_KEYWORDS: Dict[str, str] = {
+    "restricted": CLASSIFICATION_RESTRICTED,
+    "secret": CLASSIFICATION_RESTRICTED,
+    "aadhaar": CLASSIFICATION_RESTRICTED,
+    "credit card": CLASSIFICATION_RESTRICTED,
+    "bank account": CLASSIFICATION_RESTRICTED,
+    "confidential": CLASSIFICATION_CONFIDENTIAL,
+    "salary": CLASSIFICATION_CONFIDENTIAL,
+    "password": CLASSIFICATION_CONFIDENTIAL,
+    "pan": CLASSIFICATION_CONFIDENTIAL,
+    "internal": CLASSIFICATION_INTERNAL,
+}
+
+
+# â”€â”€â”€ Known capture / recording / sharing applications â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+SCREENSHOT_PROCESSES: Set[str] = {
+    "flameshot", "gnome-screenshot", "gnome-screenshot-service",
+    "spectacle", "shutter", "ksnip", "xfce4-screenshooter",
+}
+
+RECORDING_PROCESSES: Set[str] = {
+    "obs", "obs64", "simplescreenrecorder", "kazam", "peek",
+}
+
+SHARING_PROCESSES: Set[str] = {
+    "zoom", "teams", "anydesk", "teamviewer", "rustdesk",
+    "chrome-remote-desktop", "remotedesktop",
+}
+
+# Some tools (vlc, ffmpeg) are legitimate for a huge range of everyday use
+# and only become a screen-recording concern when invoked with a screen
+# capture source. Detected via a cheap command-line substring check rather
+# than blanket process-name matching, to avoid false positives on normal
+# media playback / transcoding.
+RECORDING_CMDLINE_MARKERS: Dict[str, Tuple[str, ...]] = {
+    "ffmpeg": ("x11grab", "-f x11grab"),
+    "vlc": ("screen://", "--screen"),
+}
+
+# Human-friendly display names for event "method"/"processName" fields.
+_DISPLAY_NAMES: Dict[str, str] = {
+    "obs": "OBS", "obs64": "OBS", "gnome-screenshot": "GNOME Screenshot",
+    "gnome-screenshot-service": "GNOME Screenshot", "flameshot": "Flameshot",
+    "spectacle": "Spectacle", "shutter": "Shutter", "ksnip": "Ksnip",
+    "xfce4-screenshooter": "Xfce Screenshooter", "kazam": "Kazam",
+    "peek": "Peek", "simplescreenrecorder": "SimpleScreenRecorder",
+    "zoom": "Zoom", "teams": "Microsoft Teams", "anydesk": "AnyDesk",
+    "teamviewer": "TeamViewer", "rustdesk": "RustDesk",
+    "chrome-remote-desktop": "Chrome Remote Desktop",
+    "remotedesktop": "Chrome Remote Desktop", "ffmpeg": "ffmpeg",
+    "vlc": "VLC",
+}
+
+
+def _display_name(process_name: str) -> str:
+    """Return a human-friendly name for a known process, else the raw name."""
+    return _DISPLAY_NAMES.get(process_name, process_name)
+
+
+ClassifierCallback = Callable[[str, str], str]
+EventCallback = Callable[[Dict[str, Any]], None]
+
+
+class ScreenCaptureMonitor:
+    """
+    Detects (and, in Protection Mode, actively disrupts) unauthorized
+    screenshots, screen recordings and screen sharing of sensitive
+    content on Linux endpoints.
+
+    Detection layers (independent of one another, matching the Windows
+    design so no single bypass -- menu, CLI, D-Bus, browser API -- defeats
+    the monitor):
+
+        1. Keyboard shortcut detection (evdev)
+        2. Process monitoring (psutil)
+        3. Active window monitoring (python-xlib, X11 only)
+        4. OCR-based content classification (pytesseract)
+        5. Screen recording process detection
+        6. Screen sharing process detection
+
+    Operating modes:
+        "monitor"    -- detect and log/alert only, never terminate anything.
+        "protection" -- detect AND actively terminate offending processes
+                        when sensitive content is on screen.
+
+    Args:
+        event_callback: Called with a dict for every detected event. See
+            ``_build_event`` for the schema.
+        classifier: Optional override for classification. Must match the
+            signature ``(window_title, process_name) -> classification_str``
+            where classification_str is one of Public/Internal/
+            Confidential/Restricted. If omitted, the monitor performs its
+            own screenshot + OCR + keyword based classification.
+        mode: "monitor" or "protection".
+        process_poll_interval: Seconds between process-list scans.
+        content_scan_interval: Seconds between OCR content scans.
+        sensitive_keywords: Optional override/extension of
+            DEFAULT_SENSITIVE_KEYWORDS.
+        popup_cooldown_seconds: Minimum gap between "blocked" log/alert
+            entries for repeated keyboard shortcut presses, so mashing
+            PrintScreen doesn't flood the log (mirrors the Windows
+            m_lastPopupMs cooldown).
+    """
+
+    def __init__(
+        self,
+        event_callback: Optional[EventCallback] = None,
+        classifier: Optional[ClassifierCallback] = None,
+        mode: str = "monitor",
+        process_poll_interval: float = 2.0,
+        content_scan_interval: float = 5.0,
+        sensitive_keywords: Optional[Dict[str, str]] = None,
+        popup_cooldown_seconds: float = 3.0,
+    ) -> None:
+        self.event_callback = event_callback
+        self._external_classifier = classifier
+        self.mode = mode if mode in ("monitor", "protection") else "monitor"
+        self.process_poll_interval = process_poll_interval
+        self.content_scan_interval = content_scan_interval
+        self.sensitive_keywords = dict(sensitive_keywords or DEFAULT_SENSITIVE_KEYWORDS)
+        self.popup_cooldown_seconds = popup_cooldown_seconds
+
+        self._running = False
+        self._threads: List[threading.Thread] = []
+        self._lock = threading.Lock()
+
+        # Updated continuously by content_scan_thread; read by the fast
+        # keyboard-shortcut path exactly like Windows' m_screenIsSensitive.
+        self.screen_is_sensitive: bool = False
+        self._current_classification: str = CLASSIFICATION_PUBLIC
+
+        self._known_screenshot_pids: Set[int] = set()
+        self._known_recording_pids: Set[int] = set()
+        self._known_sharing_pids: Set[int] = set()
+
+        self._last_alert_monotonic: float = 0.0
+
+        self._xlib_display = None
+        self._is_wayland = self._detect_wayland()
+        self._logged_no_display = False
+
+        if self._is_wayland:
+            logger.warning(
+                "WAYLAND_SESSION_DETECTED: active-window lookup and "
+                "screenshot/OCR classification are unavailable under "
+                "Wayland (no portable API for either). Process, keyboard "
+                "shortcut, and recording/sharing-app detection still run "
+                "normally; content classification will default to '%s' "
+                "until a window/screenshot-capable session is available.",
+                CLASSIFICATION_PUBLIC,
+            )
+        elif not os.environ.get("DISPLAY"):
+            logger.warning(
+                "NO_DISPLAY_DETECTED: $DISPLAY is not set. Active-window "
+                "lookup and OCR-based content classification will be "
+                "skipped until a display is available."
+            )
+
+        if not PIL_AVAILABLE:
+            logger.warning("Pillow not installed â€” screenshot-based OCR content scanning disabled")
+        if not TESSERACT_AVAILABLE:
+            logger.warning("pytesseract not installed â€” OCR content scanning disabled")
+        if not XLIB_AVAILABLE:
+            logger.warning("python-xlib not installed â€” active window detection disabled")
+        if not EVDEV_AVAILABLE:
+            logger.warning("evdev not installed â€” keyboard shortcut detection disabled")
+
+    # â”€â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def start(self) -> None:
+        """Start all monitoring threads as daemon threads."""
+        if self._running:
+            return
+        self._running = True
+
+        self._threads = [
+            threading.Thread(target=self.process_monitor_thread, daemon=True,
+                              name="scm-process-monitor"),
+            threading.Thread(target=self.content_scan_thread, daemon=True,
+                              name="scm-content-scan"),
+            threading.Thread(target=self.keyboard_monitor_thread, daemon=True,
+                              name="scm-keyboard-monitor"),
+        ]
+        for t in self._threads:
+            t.start()
+
+        logger.info("Monitor started (mode=%s)", self.mode)
+
+    def stop(self) -> None:
+        """Signal all monitoring threads to stop and join them."""
+        if not self._running:
+            return
+        self._running = False
+
+        for t in self._threads:
+            try:
+                t.join(timeout=10)
+            except Exception as exc:
+                logger.error("Error joining thread %s: %s", t.name, exc)
+        self._threads = []
+
+        logger.info("Monitor stopped")
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def _sleep_interruptible(self, seconds: float) -> None:
+        """Sleep in small increments so stop() takes effect quickly."""
+        deadline = time.monotonic() + max(seconds, 0.0)
+        while self._running and time.monotonic() < deadline:
+            time.sleep(0.1)
+
+    # â”€â”€â”€ Wayland / X11 helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    @staticmethod
+    def _detect_wayland() -> bool:
+        session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        if session_type == "wayland":
+            return True
+        if os.environ.get("WAYLAND_DISPLAY"):
+            return True
+        return False
+
+    def _get_active_window(self) -> Tuple[str, str]:
+        """
+        Return (window_title, process_name) of the active X11 window.
+        Returns ("", "") gracefully on Wayland or any X11 error â€” never
+        raises.
+        """
+        if self._is_wayland or not XLIB_AVAILABLE:
+            return "", ""
+
+        try:
+            if self._xlib_display is None:
+                self._xlib_display = xlib_display.Display()
+
+            root = self._xlib_display.screen().root
+            net_active = self._xlib_display.intern_atom("_NET_ACTIVE_WINDOW")
+            prop = root.get_full_property(net_active, X.AnyPropertyType)
+            if not prop or not prop.value:
+                return "", ""
+
+            window_id = prop.value[0]
+            window = self._xlib_display.create_resource_object("window", window_id)
+
+            title = self._read_window_title(window)
+            pid = self._read_window_pid(window)
+            process_name = ""
+            if pid:
+                try:
+                    process_name = psutil.Process(pid).name()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    process_name = ""
+
+            return title, process_name
+
+        except (XError, OSError, Exception) as exc:
+            logger.debug("Active window lookup failed: %s", exc)
+            # Reset the display handle; a fresh Display() on the next call
+            # recovers from a dropped X11 connection instead of wedging.
+            self._xlib_display = None
+            return "", ""
+
+    def _read_window_title(self, window) -> str:
+        try:
+            net_wm_name = self._xlib_display.intern_atom("_NET_WM_NAME")
+            utf8_string = self._xlib_display.intern_atom("UTF8_STRING")
+            prop = window.get_full_property(net_wm_name, utf8_string)
+            if prop and prop.value:
+                value = prop.value
+                return value.decode("utf-8", errors="ignore") if isinstance(value, bytes) else str(value)
+        except Exception:
+            pass
+        try:
+            wm_name = window.get_wm_name()
+            if wm_name:
+                return wm_name if isinstance(wm_name, str) else wm_name.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        return ""
+
+    def _read_window_pid(self, window) -> Optional[int]:
+        try:
+            net_wm_pid = self._xlib_display.intern_atom("_NET_WM_PID")
+            prop = window.get_full_property(net_wm_pid, X.AnyPropertyType)
+            if prop and prop.value:
+                return int(prop.value[0])
+        except Exception:
+            pass
+        return None
+
+    # â”€â”€â”€ OCR content scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _capture_screenshot(self):
+        """Grab the current screen via Pillow. Returns None on any failure."""
+        if self._is_wayland or not PIL_AVAILABLE:
+            return None
+        try:
+            return ImageGrab.grab()
+        except Exception as exc:
+            logger.debug("Screenshot capture failed: %s", exc)
+            return None
+
+    def _run_ocr(self, image) -> str:
+        """Run OCR on a captured screenshot. Returns "" on any failure."""
+        if not TESSERACT_AVAILABLE or image is None:
+            return ""
+        try:
+            text = pytesseract.image_to_string(image) or ""
+            logger.debug("OCR completed (%d chars extracted)", len(text))
+            return text
+        except Exception as exc:
+            logger.debug("OCR failed: %s", exc)
+            return ""
+
+    def _classify_text(self, text: str) -> str:
+        """Classify raw text against the sensitive keyword table."""
+        text_lower = (text or "").lower()
+        best = CLASSIFICATION_PUBLIC
+        for keyword, level in self.sensitive_keywords.items():
+            if keyword in text_lower and _CLASSIFICATION_RANK[level] > _CLASSIFICATION_RANK[best]:
+                best = level
+        return best
+
+    def _classify_now(self, window_title: str = "", process_name: str = "") -> str:
+        """
+        Produce a fresh classification for the current screen.
+
+        If an external classifier was supplied at construction time, it is
+        used exclusively (matching Windows' SetClassifier() extension
+        point) so a caller can plug in a more sophisticated, policy-aware
+        classifier (e.g. reusing DLPAgent._classify_content's regex
+        rules) without touching this module.
+
+        Otherwise, falls back to this module's own screenshot + OCR +
+        keyword based classification.
+        """
+        if self._external_classifier is not None:
+            try:
+                return self._external_classifier(window_title, process_name)
+            except Exception as exc:
+                logger.error("External classifier raised an exception: %s", exc)
+                return CLASSIFICATION_PUBLIC
+
+        combined_text = window_title or ""
+        image = self._capture_screenshot()
+        if image is not None:
+            ocr_text = self._run_ocr(image)
+            if ocr_text:
+                combined_text = f"{combined_text}\n{ocr_text}"
+
+        classification = self._classify_text(combined_text)
+        if classification in SENSITIVE_CLASSIFICATIONS:
+            logger.warning("SENSITIVE_CONTENT_DETECTED: classification=%s window=%r",
+                            classification, window_title)
+        return classification
+
+    def content_scan_thread(self) -> None:
+        """
+        Periodically re-classify the active window/screen and keep
+        ``self.screen_is_sensitive`` current. This is the fast-path flag
+        that the keyboard-monitor thread reads, so it never has to run a
+        full OCR pass itself.
+        """
+        while self._running:
+            try:
+                title, process_name = self._get_active_window()
+                classification = self._classify_now(title, process_name)
+
+                with self._lock:
+                    was_sensitive = self.screen_is_sensitive
+                    self.screen_is_sensitive = classification in SENSITIVE_CLASSIFICATIONS
+                    self._current_classification = classification
+                    now_sensitive = self.screen_is_sensitive
+
+                if now_sensitive and not was_sensitive:
+                    logger.warning(
+                        "SCREEN_CONTEXT_SENSITIVE: %s content on screen â€” "
+                        "screenshots/recording/sharing will be %s | window=%r",
+                        classification,
+                        "blocked" if self.mode == "protection" else "alerted",
+                        title,
+                    )
+                elif not now_sensitive and was_sensitive:
+                    logger.info("SCREEN_CONTEXT_CLEAR: foreground no longer sensitive | window=%r", title)
+
+            except Exception as exc:
+                logger.error("Content scan error: %s", exc)
+
+            self._sleep_interruptible(self.content_scan_interval)
+
+    # â”€â”€â”€ Process monitoring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _categorize_process(self, name: str, cmdline_str: str) -> Optional[str]:
+        """Return 'screenshot' | 'recording' | 'sharing' | None for a process."""
+        if name in SCREENSHOT_PROCESSES:
+            return "screenshot"
+        if name in RECORDING_PROCESSES:
+            return "recording"
+        markers = RECORDING_CMDLINE_MARKERS.get(name)
+        if markers and any(marker in cmdline_str for marker in markers):
+            return "recording"
+        if name in SHARING_PROCESSES:
+            return "sharing"
+        return None
+
+    def process_monitor_thread(self) -> None:
+        """Continuously scan running processes for capture/recording/sharing tools."""
+        while self._running:
+            try:
+                current: Dict[str, Dict[int, str]] = {
+                    "screenshot": {}, "recording": {}, "sharing": {},
+                }
+
+                for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                    try:
+                        name = (proc.info.get("name") or "").lower()
+                        cmdline = proc.info.get("cmdline") or []
+                        cmdline_str = " ".join(cmdline).lower()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
+
+                    category = self._categorize_process(name, cmdline_str)
+                    if category is None:
+                        continue
+
+                    current[category][proc.info["pid"]] = name
+
+                self._handle_new_detections(current["screenshot"], self._known_screenshot_pids, "screenshot")
+                self._handle_new_detections(current["recording"], self._known_recording_pids, "recording")
+                self._handle_new_detections(current["sharing"], self._known_sharing_pids, "sharing")
+
+                self._known_screenshot_pids = set(current["screenshot"])
+                self._known_recording_pids = set(current["recording"])
+                self._known_sharing_pids = set(current["sharing"])
+
+            except Exception as exc:
+                logger.error("Process monitor error: %s", exc)
+
+            self._sleep_interruptible(self.process_poll_interval)
+
+    def _handle_new_detections(self, current: Dict[int, str], known: Set[int], category: str) -> None:
+        for pid in set(current) - known:
+            process_name = current[pid]
+            logger.info("Detected capture application: %s", _display_name(process_name))
+            self._handle_process_detection(pid, process_name, category)
+
+    def _handle_process_detection(self, pid: int, process_name: str, category: str) -> None:
+        title, active_process = self._get_active_window()
+        classification = self._classify_now(title, process_name)
+        is_sensitive = classification in SENSITIVE_CLASSIFICATIONS
+
+        action = "Allowed"
+        if is_sensitive:
+            if self.mode == "protection":
+                terminated = self._terminate_process(pid, process_name)
+                action = "Blocked" if terminated else "Alerted"
+            else:
+                action = "Alerted"
+
+        method = _display_name(process_name)
+        self._emit_event(self._build_event(
+            method=method,
+            process_name=_display_name(process_name),
+            active_window=title,
+            classification=classification,
+            contains_sensitive_data=is_sensitive,
+            action_taken=action,
+        ))
+
+        if action == "Blocked":
+            logger.warning("SCREEN_ACTION_ENFORCED: terminated %s (pid=%d) â€” %s data visible",
+                            method, pid, classification)
+        elif is_sensitive:
+            logger.warning("SCREEN_CAPTURE_ALERT: %s detected while %s content on screen",
+                            method, classification)
+        else:
+            logger.info("SCREEN_CAPTURE_ALLOWED: %s â€” no sensitive data on screen", method)
+
+    def _terminate_process(self, pid: int, process_name: str) -> bool:
+        """Terminate a process by PID. Returns True if it is no longer running afterwards."""
+        try:
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except psutil.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+            return True
+        except psutil.NoSuchProcess:
+            return True
+        except psutil.AccessDenied as exc:
+            logger.error("Permission denied terminating %s (pid=%d): %s â€” "
+                         "the agent may need to run with elevated privileges "
+                         "to enforce Protection Mode", process_name, pid, exc)
+            return False
+        except Exception as exc:
+            logger.error("Failed to terminate %s (pid=%d): %s", process_name, pid, exc)
+            return False
+
+    def _reactive_sweep(self) -> None:
+        """
+        Run an immediate, out-of-cycle process scan. Triggered right after
+        a screenshot hotkey is detected while sensitive content is on
+        screen, so a tool the shortcut just launched is caught without
+        waiting for the next scheduled process_monitor_thread poll.
+        """
+        try:
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    name = (proc.info.get("name") or "").lower()
+                    cmdline = proc.info.get("cmdline") or []
+                    cmdline_str = " ".join(cmdline).lower()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+
+                category = self._categorize_process(name, cmdline_str)
+                if category is None:
+                    continue
+
+                pid = proc.info["pid"]
+                already_known = pid in (
+                    self._known_screenshot_pids | self._known_recording_pids | self._known_sharing_pids
+                )
+                if already_known:
+                    continue
+
+                logger.info("Detected capture application: %s (reactive sweep)", _display_name(name))
+                self._handle_process_detection(pid, name, category)
+        except Exception as exc:
+            logger.error("Reactive sweep error: %s", exc)
+
+    # â”€â”€â”€ Keyboard shortcut monitoring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def keyboard_monitor_thread(self) -> None:
+        """
+        Detect (never blocks, see module docstring) screenshot-related
+        keyboard shortcuts using evdev: PrintScreen, Shift/Ctrl/Alt+
+        PrintScreen, and Meta+Shift+S.
+        """
+        if not EVDEV_AVAILABLE:
+            return
+
+        devices = self._find_keyboard_devices()
+        if not devices:
+            logger.warning(
+                "No accessible keyboard input devices found â€” keyboard "
+                "shortcut detection disabled. On most distributions this "
+                "requires the agent's user to be in the 'input' group "
+                "(or running as root)."
+            )
+            return
+
+        logger.info("Keyboard monitor attached to %d input device(s)", len(devices))
+
+        pressed: Set[int] = set()
+        try:
+            import selectors
+            selector = selectors.DefaultSelector()
+            for dev in devices:
+                selector.register(dev, selectors.EVENT_READ)
+
+            while self._running:
+                for key, _mask in selector.select(timeout=0.5):
+                    device = key.fileobj
+                    try:
+                        for event in device.read():
+                            self._process_key_event(event, pressed)
+                    except (OSError, BlockingIOError):
+                        continue
+                    except Exception as exc:
+                        logger.debug("Keyboard device read error: %s", exc)
+        except Exception as exc:
+            logger.error("Keyboard monitor thread error: %s", exc)
+        finally:
+            for dev in devices:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+
+    def _find_keyboard_devices(self) -> List["evdev.InputDevice"]:
+        found: List["evdev.InputDevice"] = []
+        try:
+            paths = evdev.list_devices()
+        except Exception as exc:
+            logger.warning("Could not list input devices: %s", exc)
+            return found
+
+        for path in paths:
+            try:
+                dev = evdev.InputDevice(path)
+                capabilities = dev.capabilities().get(ecodes.EV_KEY, [])
+                if ecodes.KEY_SYSRQ in capabilities or getattr(ecodes, "KEY_PRINT", -1) in capabilities:
+                    found.append(dev)
+            except PermissionError as exc:
+                logger.debug("No permission for input device %s: %s", path, exc)
+            except Exception as exc:
+                logger.debug("Skipping input device %s: %s", path, exc)
+        return found
+
+    def _process_key_event(self, event, pressed: Set[int]) -> None:
+        if event.type != ecodes.EV_KEY:
+            return
+
+        code = event.code
+        if event.value == 1:      # key down
+            pressed.add(code)
+        elif event.value == 0:    # key up
+            pressed.discard(code)
+            return
+        else:                      # autorepeat â€” ignore for combo detection
+            return
+
+        is_print_screen = code == ecodes.KEY_SYSRQ or code == getattr(ecodes, "KEY_PRINT", -1)
+        shift_down = bool(pressed & {ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT})
+        ctrl_down = bool(pressed & {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL})
+        alt_down = bool(pressed & {ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT})
+        meta_down = bool(pressed & {ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA})
+
+        method: Optional[str] = None
+        if is_print_screen:
+            if ctrl_down:
+                method = "Ctrl+PrintScreen"
+            elif alt_down:
+                method = "Alt+PrintScreen"
+            elif shift_down:
+                method = "Shift+PrintScreen"
+            else:
+                method = "PrintScreen"
+        elif code == ecodes.KEY_S and meta_down and shift_down:
+            method = "Meta+Shift+S"
+
+        if method:
+            self._handle_keyboard_shortcut(method)
+
+    def _handle_keyboard_shortcut(self, method: str) -> None:
+        logger.info("Keyboard shortcut detected: %s", method)
+
+        title, process_name = self._get_active_window()
+        with self._lock:
+            is_sensitive = self.screen_is_sensitive
+            classification = self._current_classification
+
+        action = "Allowed"
+        if is_sensitive:
+            action = "Blocked" if self.mode == "protection" else "Alerted"
+
+            now = time.monotonic()
+            with self._lock:
+                should_log_alert = (now - self._last_alert_monotonic) > self.popup_cooldown_seconds
+                if should_log_alert:
+                    self._last_alert_monotonic = now
+
+            if should_log_alert:
+                logger.warning(
+                    "SCREEN_CAPTURE_%s: %s â€” %s content currently on screen",
+                    action.upper(), method, classification,
+                )
+
+            if self.mode == "protection":
+                # Reactive prevention: this thread cannot itself swallow the
+                # keystroke (see module docstring), so it immediately sweeps
+                # for -- and terminates -- any capture/recording tool the
+                # shortcut may have just launched, instead of waiting for
+                # the next scheduled process_monitor_thread poll.
+                self._reactive_sweep()
+        else:
+            logger.info("SCREEN_CAPTURE_ALLOWED: %s â€” no sensitive data on screen", method)
+
+        self._emit_event(self._build_event(
+            method=method,
+            process_name=process_name or "unknown",
+            active_window=title,
+            classification=classification,
+            contains_sensitive_data=is_sensitive,
+            action_taken=action,
+        ))
+
+    # â”€â”€â”€ Event construction / dispatch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    @staticmethod
+    def _get_timestamp() -> str:
+        return datetime.utcnow().isoformat() + "Z"
+
+    def _build_event(
+        self,
+        method: str,
+        process_name: str,
+        active_window: str,
+        classification: str,
+        contains_sensitive_data: bool,
+        action_taken: str,
+    ) -> Dict[str, Any]:
+        return {
+            "eventType": "screen_capture",
+            "method": method,
+            "processName": process_name,
+            "activeWindow": active_window,
+            "classification": classification,
+            "containsSensitiveData": contains_sensitive_data,
+            "actionTaken": action_taken,
+            "timestamp": self._get_timestamp(),
+        }
+
+    def _emit_event(self, event: Dict[str, Any]) -> None:
+        if not self.event_callback:
+            return
+        try:
+            self.event_callback(event)
+        except Exception as exc:
+            logger.error("Event callback raised an exception: %s", exc)
+

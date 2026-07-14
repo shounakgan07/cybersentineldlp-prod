@@ -24,6 +24,8 @@ import requests
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
+from screen_capture_monitor import ScreenCaptureMonitor
+
 # Configure logging
 log_file = os.path.expanduser('~/cybersentinel_agent.log')
 os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -232,6 +234,12 @@ class DLPAgent:
         self.dedup_window_seconds = 5  # Ignore duplicate events within 5 seconds (increased from 2)
         self.dedup_lock = threading.Lock()  # Lock for thread-safe deduplication
 
+        # Screen capture / recording / sharing monitor (screenshots, OBS,
+        # Zoom/Teams, etc.) â€” see screen_capture_monitor.py
+        self.screen_capture_config = self.config.get("screen_capture", {}) or {}
+        self.screen_capture_enabled: bool = self.screen_capture_config.get("enabled", True)
+        self.screen_capture_monitor: Optional[ScreenCaptureMonitor] = None
+
         logger.info(f"Agent initialized: {self.agent_id}")
 
     def start(self):
@@ -248,6 +256,10 @@ class DLPAgent:
         # Start file system monitoring
         if self.config.get("monitoring", {}).get("file_system", True) and self.has_file_policies:
             self.start_file_monitoring()
+
+        # Start screen capture / recording / sharing monitor
+        if self.screen_capture_enabled:
+            self.start_screen_capture_monitoring()
 
         # Start heartbeat
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
@@ -285,7 +297,10 @@ class DLPAgent:
         
         # Unregister from server
         self.unregister_agent()
-        
+
+        # Stop screen capture monitor
+        self.stop_screen_capture_monitoring()
+
         # Stop file observers
         for observer in self.observers:
             observer.stop()
@@ -485,6 +500,86 @@ class DLPAgent:
         self.observers = []
         self.monitored_paths_set.clear()
         logger.info("File monitoring stopped")
+
+    def start_screen_capture_monitoring(self):
+        """Start the screen capture / recording / sharing monitor."""
+        if self.screen_capture_monitor is not None:
+            return
+
+        mode = self.screen_capture_config.get("mode", "monitor")
+        if mode not in ("monitor", "protection"):
+            logger.warning(f"Invalid screen_capture.mode '{mode}', defaulting to 'monitor'")
+            mode = "monitor"
+
+        self.screen_capture_monitor = ScreenCaptureMonitor(
+            event_callback=self.handle_screen_capture_event,
+            mode=mode,
+            process_poll_interval=self.screen_capture_config.get("process_poll_interval", 2.0),
+            content_scan_interval=self.screen_capture_config.get("content_scan_interval", 5.0),
+        )
+        self.screen_capture_monitor.start()
+        logger.info(f"Screen capture monitoring started (mode={mode})")
+
+    def stop_screen_capture_monitoring(self):
+        """Stop the screen capture / recording / sharing monitor."""
+        if self.screen_capture_monitor is not None:
+            self.screen_capture_monitor.stop()
+            self.screen_capture_monitor = None
+            logger.info("Screen capture monitoring stopped")
+
+    def handle_screen_capture_event(self, event: Dict[str, Any]):
+        """
+        Bridge a ScreenCaptureMonitor event (see screen_capture_monitor.py
+        _build_event schema) into the agent's send_event()/server pipeline.
+        """
+        try:
+            if not self.allow_events:
+                logger.debug("Dropping screen capture event because no active policies")
+                return
+
+            import pwd
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+
+            classification = event.get("classification", "Public")
+            is_sensitive = bool(event.get("containsSensitiveData", False))
+            action_taken = event.get("actionTaken", "Allowed")
+
+            action_map = {"Blocked": "blocked", "Alerted": "alert", "Allowed": "logged"}
+            severity_map = {
+                "Restricted": "critical",
+                "Confidential": "high",
+                "Internal": "medium",
+                "Public": "low",
+            }
+
+            event_data = {
+                "event_id": str(uuid.uuid4()),
+                "event_type": "screen_capture",
+                "event_subtype": event.get("method", "unknown"),
+                "agent_id": self.agent_id,
+                "source_type": "agent",
+                "user_email": f"{current_user}@{socket.gethostname()}",
+                "username": current_user,
+                "description": (
+                    f"Screen capture via {event.get('method')} "
+                    f"(process: {event.get('processName')}, window: {event.get('activeWindow')})"
+                ),
+                "severity": severity_map.get(classification, "low"),
+                "action": action_map.get(action_taken, "logged"),
+                "classification_level": classification,
+                "classification_category": classification,
+                "detected_content": event.get("activeWindow"),
+                "blocked": action_taken == "Blocked",
+                "timestamp": event.get("timestamp") or (datetime.utcnow().isoformat() + "Z"),
+            }
+
+            if self.active_policy_version:
+                event_data["policy_version"] = self.active_policy_version
+
+            self.send_event(event_data)
+
+        except Exception as e:
+            logger.error(f"Error handling screen capture event: {e}")
 
     def start_transfer_monitoring(self):
         """Start monitoring destination paths for non-USB file transfers."""
@@ -1049,3 +1144,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
