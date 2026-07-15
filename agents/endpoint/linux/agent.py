@@ -184,7 +184,7 @@ class TransferDestinationHandler(FileSystemEventHandler):
 class DLPAgent:
     """Main DLP Agent class"""
 
-    def __init__(self, config_path: str = "/etc/cybersentinel/agent_config.json"):
+    def __init__(self, config_path: str = None):
         self.config = AgentConfig(config_path)
         self.agent_id = self.config.get("agent_id")
         self.server_url = self.config.get("server_url")
@@ -235,7 +235,7 @@ class DLPAgent:
         self.dedup_lock = threading.Lock()  # Lock for thread-safe deduplication
 
         # Screen capture / recording / sharing monitor (screenshots, OBS,
-        # Zoom/Teams, etc.) â€” see screen_capture_monitor.py
+        # Zoom/Teams, etc.) — see screen_capture_monitor.py
         self.screen_capture_config = self.config.get("screen_capture", {}) or {}
         self.screen_capture_enabled: bool = self.screen_capture_config.get("enabled", True)
         self.screen_capture_monitor: Optional[ScreenCaptureMonitor] = None
@@ -1144,4 +1144,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
